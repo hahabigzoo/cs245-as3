@@ -44,7 +44,8 @@ public class TransactionManager {
 	private RecordManager rm;
 	private LogManager lm;
 	private StorageManager sm;
-	private PriorityQueue<Integer> que;
+	private HashMap<Long, ArrayList<Record>> recordsets;
+	private PriorityQueue<Long> que;
 	private HashMap<Long,Integer> ttag; 
 
 
@@ -53,6 +54,7 @@ public class TransactionManager {
 		writesets = new HashMap<>();
 		que=new PriorityQueue<>();
 		ttag=new HashMap<Long,Integer>();
+		recordsets=new HashMap<Long, ArrayList<Record>>();
 		//see initAndRecover
 		latestValues = null;
 	}
@@ -82,7 +84,7 @@ public class TransactionManager {
 			logtags.add(offset);
 		}
 		/**
-		 * 持久化：对已经提交的事务的日志重做
+		 * 持久化：对已经提交的事务的日志重做,并持久化写入
 		 */
 		
 		Iterator<Integer> it=logtags.iterator(); 
@@ -90,16 +92,11 @@ public class TransactionManager {
 			if(txCommit.contains(rd.getTxID()) && rd.getType()==1){
 				long tag = it.next();
 				latestValues.put(rd.getKey(), new TaggedValue(tag, rd.getData()));
+				que.add(tag);
+				sm.queueWrite(rd.getKey(), tag, rd.getData());
 			}
 		}
 		
-		/**
-		 * 将修复后的表持久化
-		 */
-		for(Long key: latestValues.keySet()){
-			sm.queueWrite(key, latestValues.get(key).tag, latestValues.get(key).value);
-		}
-		//lm.setLogTruncationOffset(lm.getLogEndOffset());
 	}
 
 	/**
@@ -107,9 +104,8 @@ public class TransactionManager {
 	 */
 	public void start(long txID) {
 		// TODO: Not implemented for non-durable transactions, you should implement this
-		int tag=(int)rm.writeStart(txID, lm);
-		que.add(tag);
-		ttag.put(txID, tag);
+		recordsets.put(txID, new ArrayList<Record>());
+		//recordsets.get(txID).add(rm.start(txID));
 	}
 
 	/**
@@ -128,6 +124,7 @@ public class TransactionManager {
 	public void write(long txID, long key, byte[] value) {
 		//rm.writeContext(txID, lm, key, value);
 		ArrayList<WritesetEntry> writeset = writesets.get(txID);
+		recordsets.get(txID).add(rm.write(txID,key,value));
 		if (writeset == null) {
 			writeset = new ArrayList<>();
 			writesets.put(txID, writeset); 
@@ -138,24 +135,34 @@ public class TransactionManager {
 	 * Commits a transaction, and makes its writes visible to subsequent read operations.\
 	 */
 	public void commit(long txID){
+		recordsets.get(txID).add(rm.commit(txID));
 		ArrayList<WritesetEntry> writeset = writesets.get(txID);
+		HashMap<Long,Long> keyTag=new HashMap<Long,Long>();
+		for(Record rd: recordsets.get(txID)){
+			if(rd.getType()==1){
+				keyTag.put(rd.getKey(),rm.writeRecord(lm,rd));
+			}else{
+				rm.writeRecord(lm,rd);
+			}
+			
+		}
 		if (writeset != null) {
 			for(WritesetEntry x : writeset) {
 				//tag is unused in this implementation:
-				long tag = rm.writeContext(txID, lm, x.key, x.value);
-				
+				long tag=keyTag.get(x.key);
 				latestValues.put(x.key, new TaggedValue(tag, x.value));
+				que.add(tag);
 				sm.queueWrite(x.key, tag, x.value);
 			}
 			writesets.remove(txID);
 		}
-		rm.writeCommit(txID, lm);
 	}
 	/**
 	 * Aborts a transaction.
 	 */
 	public void abort(long txID) {
-		rm.writeAbort(txID, lm);
+		rm.abort(txID);
+		recordsets.remove(txID);
 		writesets.remove(txID);
 	}
 
@@ -164,8 +171,9 @@ public class TransactionManager {
 	 * These calls are in order of writes to a key and will occur once for every such queued write, unless a crash occurs.
 	 */
 	public void writePersisted(long key, long persisted_tag, byte[] persisted_value) {
-		if(que.size()==0){
+		if(persisted_tag==que.peek()){
 			lm.setLogTruncationOffset((int)persisted_tag);
 		}
+		que.remove(persisted_tag);
 	}
 }
